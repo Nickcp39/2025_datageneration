@@ -1,0 +1,20 @@
+# 本地 3060 训练参数（可按需改）
+data_root: "./data2025_sample"   # 本地数据根目录
+out_dir: "./runs_local"          # 训练输出目录
+image_size: 128                  # 128 起步更稳；显存富余可改 256
+channels: 1                      # 灰度=1；若要 RGB 改 3
+batch_size: 4
+num_workers: 0                   # Windows 先用 0 更稳
+max_steps: 2000
+save_every: 200
+log_every: 20
+
+# 采样/可视化
+preview_method: "ddim"
+ddim_steps: 25
+time_dim: 256
+
+# 训练开关
+tensorboard: true                # 若脚本支持，会写入 TensorBoard
+amp: true                        # 混合精度；若不支持可忽略
+seed: 20251101
