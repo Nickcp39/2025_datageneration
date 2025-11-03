@@ -2,6 +2,7 @@
 # Minimal training loop for DDPM/DDIM with EMA and periodic sampling.
 
 import os
+import sys
 import argparse
 from itertools import cycle
 
@@ -31,7 +32,6 @@ def parse_args():
     ap.add_argument('--center_crop',    dest='center_crop', action='store_true',  default=False)
     ap.add_argument('--no_center_crop', dest='center_crop', action='store_false')
     ap.add_argument('--no_aug', action='store_true', help='disable light augmentation')
-    
 
     # training
     ap.add_argument('--batch_size', type=int, default=32)
@@ -59,7 +59,16 @@ def parse_args():
 
 def main():
     args = parse_args()
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    # ===== 必须使用 GPU：没有就直接退出 =====
+    if not torch.cuda.is_available():
+        print("❌ CUDA/GPU 未检测到：请安装 GPU 版 PyTorch 或检查显卡/驱动。训练已终止。")
+        sys.exit(2)
+
+    device = torch.device('cuda')
+    # 小优化
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
 
     # ------- IO & dirs -------
     os.makedirs(args.out_dir, exist_ok=True)
@@ -77,14 +86,18 @@ def main():
         aug=not args.no_aug,
         normalize="none",           # 输出 [0,1]，训练时再转 [-1,1]
     )
-    dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
-                    num_workers=args.num_workers, pin_memory=True, drop_last=True)
+    dl = DataLoader(
+        ds, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=True,            # 既然已强制 CUDA，这里可直接 True
+        drop_last=True
+    )
     dl_iter = cycle(dl)
 
     # ------- Model & Engine -------
     net = UNetEps(in_ch=args.channels, base=args.base, time_dim=args.time_dim, with_mid_attn=args.mid_attn).to(device)
     engine = DiffusionEngine(net, img_size=args.image_size, channels=args.channels,
-                             timesteps=args.timesteps, device=device).to(device)
+                             timesteps=args.timesteps, device=str(device)).to(device)
 
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=1e-4)
     ema = EMA(net, beta=0.9999)
@@ -99,8 +112,8 @@ def main():
     pbar = tqdm(range(1, args.max_steps + 1), ncols=100, desc="train", smoothing=0.1)
 
     for step in pbar:
-        x = next(dl_iter).to(device)   # [B,C,H,W], in [0,1]
-        x = x * 2 - 1                  # -> [-1,1]
+        x = next(dl_iter).to(device, non_blocking=True)  # [B,C,H,W], in [0,1]
+        x = x * 2 - 1                                    # -> [-1,1]
 
         t = torch.randint(0, args.timesteps, (x.size(0),), device=device).long()
         loss = engine.p_losses(x, t)
@@ -112,7 +125,6 @@ def main():
         opt.step()
         ema.update(net)
 
-        # 实时在进度条上显示 loss
         if step % args.log_every == 0:
             pbar.set_postfix(loss=f"{loss.item():.4f}")
             if tb:
@@ -133,10 +145,10 @@ def main():
                     'time_dim': args.time_dim,
                 }
             }, ckpt_path)
-            # 用 pbar.write() 避免打乱进度条
             pbar.write(f"saved: {ckpt_path}")
 
-            with torch.no_grad():
+            # 采样阶段：no_grad + autocast 到 CUDA，避免 CPU 上爆内存
+            with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.float16):
                 x_sample = engine.sample(
                     n=args.sample_n,
                     method=args.preview_method,
@@ -148,7 +160,6 @@ def main():
 
     if tb:
         tb.close()
-  
 
 
 if __name__ == '__main__':
