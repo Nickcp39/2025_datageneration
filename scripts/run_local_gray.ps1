@@ -1,24 +1,25 @@
-# One-click local training on 3060 (8GB), no YAML dependency. Save as UTF-8 (no BOM).
+# One-click local training on 3060 (8GB) - GRAYSCALE
+# 数据：python_code/data/  内含 512x512 灰度图；不做中心裁剪
 $ErrorActionPreference = "Stop"
-Write-Host ">>> RUN: run_local_3060.ps1" -ForegroundColor Yellow
+Write-Host ">>> RUN: run_local_gray.ps1" -ForegroundColor Yellow
 
 # --------- edit your params here ----------
-# relative to repo root
-$data_root   = "./data2025"
-$out_dir     = "./runs_local"
-$image_size  = 256          # ← 提升到 256
-$channels    = 1            # gray scale is 1 and color scale is 3 
+# 相对于仓库根（python_code 上一层）
+$data_root   = "./data"          # ← 灰度数据文件夹
+$out_dir     = "./runs_local_gray"
+$image_size  = 512
+$channels    = 1                 # ← 灰度
 $batch_size  = 4
 $num_workers = 0
 $max_steps   = 2000
-$save_every  = 200
-$log_every   = 20
+$save_every  = 500
+$log_every   = 50
 $preview     = "ddim"
 $ddim_steps  = 25
 $time_dim    = 256
-$seed        = ""           # 如需固定，填 42 或 20251101；留空则不传参
-$use_tb      = $true        # tensorboard flag
-$use_amp     = $false       # 3060 建议先关
+$seed        = ""                # 可填 20251101；留空则不传
+$use_tb      = $true
+$use_amp     = $false            # 3060 先关
 # ------------------------------------------
 
 # repo paths
@@ -60,9 +61,9 @@ Add-Arg "--ddim_steps"     $ddim_steps
 Add-Arg "--time_dim"       $time_dim
 if ($seed -ne "") { Add-Arg "--seed" $seed }
 
-# boolean flags
-$argsList += "--no_aug"           # 关闭增强，避免旋转黑角
-$argsList += "--no_center_crop"   # 关闭中心正方裁剪
+# flags
+$argsList += "--no_aug"
+$argsList += "--no_center_crop"   # 灰度已是正方形，不裁剪
 if ($use_tb)  { $argsList += "--tensorboard" }
 if ($use_amp) { $argsList += "--amp" }
 
