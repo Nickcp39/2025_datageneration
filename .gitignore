@@ -3,6 +3,8 @@ __pycache__/
 runs_*/
 runs_local/
 runs_debug_small/
+runs_local_gray
+runs_local_rgb
 logs/
 *.log
 data/
@@ -12,3 +14,11 @@ data2025_sample/
 *.pth
 *.ckpt
 .DS_Store
+data_RGB.zip
+# large data
+*.zip
+*.pt
+*.ckpt
+data*/
+runs*/
+logs/
