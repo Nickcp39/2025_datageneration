@@ -1,180 +1,254 @@
-# diffusion/diffusion_engine.py
-# Cosine schedule + DiffusionEngine (q_sample, loss, DDPM/DDIM sampling) + EMA
+# code/diffusion/diffusion_engine.py
+# Diffusion engine (training + sampling) with numeric guards for stability.
+# - Cosine schedule (default) or linear
+# - Epsilon prediction objective: MSE(pred_eps, true_eps)
+# - FP32 sampling (AMP disabled) to avoid "black images"
+# - DDPM / DDIM sampling consistent with eps-prediction
+# - Progress logging: x.min/max and eps_pred.min/max
 
 import math
-from dataclasses import dataclass
-from typing import Optional
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch import Tensor
+from typing import Optional, Literal, Dict
+
+# 你自己的 UNet
+from yc_code.models.unet_eps import UNetEps
 
 
-# ----------------------------
-# EMA (Exponential Moving Average)
-# ----------------------------
-class EMA:
-    """Keep an exponential moving average of model parameters to improve sampling quality."""
-    def __init__(self, model: nn.Module, beta: float = 0.9999):
-        self.beta = beta
-        self.shadow = {k: v.detach().clone() for k, v in model.state_dict().items()}
-
-    @torch.no_grad()
-    def update(self, model: nn.Module):
-        for k, v in model.state_dict().items():
-            if not v.dtype.is_floating_point:
-                continue
-            self.shadow[k].mul_(self.beta).add_(v, alpha=1 - self.beta)
-
-    def copy_to(self, model: nn.Module):
-        model.load_state_dict(self.shadow, strict=False)
+def _cosine_schedule(T: int, s: float = 0.008, eps: float = 1e-8):
+    """Cosine schedule from Nichol & Dhariwal (2021)."""
+    steps = T + 1
+    x = torch.linspace(0, T, steps)
+    alphas_cumprod = torch.cos(((x / T) + s) / (1 + s) * math.pi * 0.5) ** 2
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    alphas_cumprod = torch.clamp(alphas_cumprod, min=eps, max=1.0)  # 数值保护
+    betas = 1.0 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+    betas = torch.clamp(betas, min=eps, max=0.999)
+    return betas
 
 
-# ----------------------------
-# Cosine schedule (Nichol & Dhariwal, s=0.008)
-# ----------------------------
-@dataclass
-class DiffusionConfig:
-    timesteps: int = 1000
-    s: float = 0.008  # small offset to avoid alpha_bar = 0
+def _linear_schedule(T: int, beta_start: float = 1e-4, beta_end: float = 2e-2, eps: float = 1e-12):
+    betas = torch.linspace(beta_start, beta_end, T)
+    betas = torch.clamp(betas, min=eps, max=0.999)
+    return betas
 
 
-class CosineSchedule:
-    """Generates betas via cosine alpha_bar schedule."""
-    def __init__(self, cfg: DiffusionConfig):
-        N, s = cfg.timesteps, cfg.s
-        # t grid: 0..N
-        t = torch.linspace(0, N, N + 1, dtype=torch.float32)
-        # cosine squared schedule (normalized by value at t=0)
-        def f(x):
-            return torch.cos(((x / N) + s) / (1 + s) * math.pi / 2) ** 2
-        alpha_bar = f(t) / f(torch.tensor(0.0))
-        alpha_bar = alpha_bar.clamp(min=1e-8, max=1.0)
-
-        # betas from alpha_bar
-        # alpha_t = alpha_bar[t] / alpha_bar[t-1]
-        alphas = alpha_bar[1:] / alpha_bar[:-1]
-        betas = (1.0 - alphas).clamp(min=1e-8, max=0.999)
-        self.betas = betas  # [N]
-
-
-# ----------------------------
-# Helper: gather by t as [B,1,1,1]
-# ----------------------------
-def _gather_coef(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-    # x: [T], t: [B] -> [B,1,1,1]
-    return x.gather(0, t).view(-1, 1, 1, 1)
-
-
-# ----------------------------
-# Diffusion Engine
-# ----------------------------
 class DiffusionEngine(nn.Module):
-    """
-    Wraps a noise predictor (εθ) and provides:
-      - q_sample: forward noising
-      - p_losses: training loss (MSE on noise)
-      - sample: DDPM or DDIM sampling
-
-    Expectation:
-      - model(x_t, t) predicts noise with same shape as x_t
-      - Inputs to model should be in [-1, 1]
-      - Training script将 [0,1] 转为 [-1,1]：x = x*2 - 1
-      - 采样输出会在外部再反归一化为 [0,1]
-    """
-    def __init__(self, model: nn.Module, img_size: int, channels: int,
-                 timesteps: int = 1000, device: Optional[str] = None):
+    def __init__(
+        self,
+        image_size: int = 256,
+        channels: int = 1,
+        T: int = 1000,
+        schedule: Literal["cosine", "linear"] = "cosine",
+        beta_start: float = 1e-4,
+        beta_end: float = 2e-2,
+        net_base: int = 64,
+        time_dim: int = 256,
+        with_mid_attn: bool = True,
+        eps_guard: float = 1e-8,
+    ):
         super().__init__()
-        self.model = model
-        self.img_size = img_size
+        self.image_size = image_size
         self.channels = channels
-        self.T = timesteps
+        self.T = T
+        self.eps_guard = float(eps_guard)
 
-        # device
-        if device is None:
-            device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.device = device
+        # ------- noise schedule -------
+        if schedule == "cosine":
+            betas = _cosine_schedule(T, s=0.008, eps=eps_guard)
+        elif schedule == "linear":
+            betas = _linear_schedule(T, beta_start, beta_end, eps=eps_guard)
+        else:
+            raise ValueError(f"Unknown schedule: {schedule}")
 
-        # schedule buffers
-        betas = CosineSchedule(DiffusionConfig(timesteps=timesteps)).betas.to(self.device)  # [T]
-        alphas = 1.0 - betas                                                                 # [T]
-        alpha_bar = torch.cumprod(alphas, dim=0)                                             # [T]
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        alphas_cumprod_prev = torch.cat([torch.tensor([1.0]), alphas_cumprod[:-1]])
 
-        # register as buffers for safe .to() etc.
-        self.register_buffer('betas', betas)
-        self.register_buffer('alphas', alphas)
-        self.register_buffer('alpha_bar', alpha_bar)
-        self.register_buffer('sqrt_alpha_bar', torch.sqrt(alpha_bar))
-        self.register_buffer('sqrt_one_minus_alpha_bar', torch.sqrt(1.0 - alpha_bar))
+        # 关键 buffers（全部加 eps 防护，避免 sqrt(负数) 或除 0）
+        self.register_buffer("betas", betas.float())
+        self.register_buffer("alphas", torch.clamp(alphas, min=eps_guard, max=1.0).float())
+        self.register_buffer("alphas_cumprod", torch.clamp(alphas_cumprod, min=eps_guard, max=1.0).float())
+        self.register_buffer("alphas_cumprod_prev", torch.clamp(alphas_cumprod_prev, min=eps_guard, max=1.0).float())
 
-        # posterior variance for DDPM sampling
-        # Var[q(x_{t-1} | x_t, x_0)] = beta_t * (1 - ᾱ_{t-1}) / (1 - ᾱ_t)
-        alpha_bar_prev = torch.cat([torch.tensor([1.0], device=self.device), alpha_bar[:-1]], dim=0)
-        posterior_var = betas * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar)
-        self.register_buffer('posterior_var', posterior_var)  # [T]
+        self.register_buffer("sqrt_alphas_cumprod", torch.sqrt(torch.clamp(self.alphas_cumprod, min=eps_guard)).float())
+        self.register_buffer(
+            "sqrt_one_minus_alphas_cumprod",
+            torch.sqrt(torch.clamp(1.0 - self.alphas_cumprod, min=eps_guard)).float()
+        )
+        self.register_buffer("sqrt_recip_alphas", torch.sqrt(torch.clamp(1.0 / self.alphas, min=eps_guard)).float())
+        self.register_buffer(
+            "sqrt_recipm1_alphas",
+            torch.sqrt(torch.clamp(1.0 / self.alphas - 1.0, min=eps_guard)).float()
+        )
+        self.register_buffer(
+            "posterior_variance",
+            torch.clamp(
+                betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod + eps_guard),
+                min=eps_guard
+            ).float()
+        )
+        self.register_buffer(
+            "posterior_log_variance_clipped",
+            torch.log(torch.clamp(self.posterior_variance, min=eps_guard)).float()
+        )
+        self.register_buffer(
+            "posterior_mean_coef1",
+            (torch.sqrt(torch.clamp(alphas_cumprod_prev, min=eps_guard)) * betas / torch.clamp(1.0 - alphas_cumprod, min=eps_guard)).float()
+        )
+        self.register_buffer(
+            "posterior_mean_coef2",
+            (torch.sqrt(torch.clamp(alphas, min=eps_guard)) * (1.0 - alphas_cumprod_prev) / torch.clamp(1.0 - alphas_cumprod, min=eps_guard)).float()
+        )
 
-    # ------------- forward diffusion -------------
-    def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise: Optional[torch.Tensor] = None):
+        # ------- network -------
+        self.net = UNetEps(in_ch=channels, base=net_base, time_dim=time_dim, with_mid_attn=with_mid_attn)
+
+    # -------------------- Forward diffusion helpers --------------------
+    def q_sample(self, x_start: Tensor, t: Tensor, noise: Optional[Tensor] = None) -> Tensor:
         """
-        Sample x_t ~ q(x_t | x_0) = sqrt(alpha_bar_t) * x0 + sqrt(1 - alpha_bar_t) * eps
-        x0: [-1,1], [B,C,H,W]
-        t:  [B] long
+        x_t = sqrt(a_bar_t) * x_0 + sqrt(1 - a_bar_t) * eps
         """
         if noise is None:
-            noise = torch.randn_like(x0)
-        sqrt_ab = _gather_coef(self.sqrt_alpha_bar, t)
-        sqrt_om = _gather_coef(self.sqrt_one_minus_alpha_bar, t)
-        return sqrt_ab * x0 + sqrt_om * noise, noise
+            noise = torch.randn_like(x_start)
+        sqrt_ab = self._extract(self.sqrt_alphas_cumprod, t, x_start.shape)
+        sqrt_om = self._extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
+        return sqrt_ab * x_start + sqrt_om * noise
 
-    # ------------- training loss -------------
-    def p_losses(self, x0: torch.Tensor, t: torch.Tensor):
-        """
-        Predict noise and compute MSE.
-        """
-        xt, noise = self.q_sample(x0, t)
-        pred = self.model(xt, t.float())
-        return F.mse_loss(pred, noise)
+    def _extract(self, a, t, x_shape):
+        # a: [T] buffer on device/dtype
+        # t: [B] (long/float ok)
+        if t.dtype != torch.long:
+            t = t.long()
+        t = t.clamp(0, self.T - 1).to(a.device)        # 非原地
+        vals = a.index_select(0, t)                    # [B]
+        while vals.dim() < len(x_shape):               # -> [B,1,1,1]
+            vals = vals.unsqueeze(-1)
+        return vals.expand(x_shape)                    # broadcast 到 x_shape
 
-    # ------------- sampling (DDPM / DDIM) -------------
+
+    # -------------------- Training objective: eps-prediction --------------------
+    def p_losses(self, x_start: Tensor, t: Tensor, noise: Optional[Tensor] = None) -> Dict[str, Tensor]:
+        if noise is None:
+            noise = torch.randn_like(x_start)
+        x_noisy = self.q_sample(x_start, t, noise)
+        # 预测的是 epsilon
+        pred_noise = self.net(x_noisy, t)
+        loss = F.mse_loss(pred_noise, noise)
+        return {"loss": loss, "pred_noise": pred_noise.detach(), "x_noisy": x_noisy.detach()}
+
+    # -------------------- DDPM sampling step (eps-prediction) --------------------
     @torch.no_grad()
-    def sample(self, n: int = 16, method: str = 'ddim', ddim_steps: int = 50) -> torch.Tensor:
+    def p_sample(self, x_t: Tensor, t: Tensor, log_every: bool = False) -> Tensor:
         """
-        Return x in [-1,1], shape [n, C, H, W].
-        method: 'ddpm' or 'ddim'
+        x_{t-1} = 1/sqrt(alpha_t) * (x_t - (beta_t/sqrt(1-alpha_bar_t)) * eps_theta(x_t, t)) + sigma_t * z
+        sigma_t^2 = posterior_variance_t
         """
-        shape = (n, self.channels, self.img_size, self.img_size)
-        x = torch.randn(shape, device=self.device)
+        eps = self.net(x_t, t)
+        if log_every:
+            # 打印统计，易于发现“全零/饱和”
+            print(f"[DDPM] t={t[0].item():4d} | x.min={x_t.min().item():+.4f}, x.max={x_t.max().item():+.4f} | "
+                  f"eps.min={eps.min().item():+.4f}, eps.max={eps.max().item():+.4f}")
 
-        if method.lower() == 'ddpm':
-            # ancestral sampling
-            for i in reversed(range(self.T)):
-                t = torch.full((n,), i, device=self.device, dtype=torch.long)
-                eps = self.model(x, t.float())
-                a_t = self.alphas[i]
-                ab_t = self.alpha_bar[i]
-                sqrt_recip_a = torch.sqrt(1.0 / a_t)
-                sqrt_one_minus_ab = torch.sqrt(1.0 - ab_t)
+        b = x_t.shape[0]
+        sqrt_recip_alpha_t = self._extract(self.sqrt_recip_alphas, t, x_t.shape)
+        beta_t = self._extract(self.betas, t, x_t.shape)
+        sqrt_one_minus_ab_t = self._extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape)
 
-                # mean of posterior q(x_{t-1} | x_t, x_0) with predicted noise
-                x = sqrt_recip_a * (x - (1 - a_t) / (sqrt_one_minus_ab + 1e-8) * eps)
+        # 预测 x0（可用于可视化或指导），但主公式使用 eps 形式
+        # x0_pred = (x_t - sqrt(1-a_bar)*eps) / sqrt(a_bar)  # 这里不直接用，防止数值不稳
 
-                if i > 0:
-                    var = self.posterior_var[i].clamp(min=1e-20)
-                    x = x + torch.sqrt(var) * torch.randn_like(x)
+        mean = sqrt_recip_alpha_t * (x_t - (beta_t / torch.clamp(sqrt_one_minus_ab_t, min=self.eps_guard)) * eps)
 
-            return x.clamp(-1, 1)
+        # 当 t > 0 才加噪声；t=0 直接返回均值
+        noise = torch.randn_like(x_t)
+        mask = (t > 0).float().view(b, *([1] * (x_t.dim() - 1)))
+        var = self._extract(self.posterior_variance, t, x_t.shape)
+        nonzero_term = mask * torch.sqrt(torch.clamp(var, min=self.eps_guard)) * noise
+        return mean + nonzero_term
 
-        # DDIM (deterministic fast sampling)
-        steps = int(ddim_steps)
-        ts = torch.linspace(self.T - 1, 0, steps=steps, device=self.device).long()
-        for si, ti in enumerate(ts):
-            t = torch.full((n,), ti.item(), device=self.device, dtype=torch.long)
-            eps = self.model(x, t.float())
-            ab_t = self.alpha_bar[ti]
-            ab_prev = self.alpha_bar[ts[si + 1]] if si < steps - 1 else torch.tensor(1.0, device=self.device)
+    # -------------------- DDIM sampling (eps-prediction, eta controls stochasticity) --------------------
+    @torch.no_grad()
+    def ddim_step(self, x_t: Tensor, t: Tensor, t_prev: Tensor, eta: float = 0.0, log_every: bool = False) -> Tensor:
+        """
+        DDIM update (ε-pred). When eta=0, deterministic.
+        """
+        eps = self.net(x_t, t)
+        if log_every:
+            print(f"[DDIM] t={t[0].item():4d}->{t_prev[0].item():4d} | x.min={x_t.min().item():+.4f}, "
+                  f"x.max={x_t.max().item():+.4f} | eps.min={eps.min().item():+.4f}, eps.max={eps.max().item():+.4f}")
 
-            x0_pred = (x - torch.sqrt(1.0 - ab_t) * eps) / (torch.sqrt(ab_t) + 1e-8)
-            dir_xt = torch.sqrt(1.0 - ab_prev) * eps
-            x = torch.sqrt(ab_prev) * x0_pred + dir_xt
+        a_bar_t = self._extract(self.alphas_cumprod, t, x_t.shape)
+        a_bar_prev = self._extract(self.alphas_cumprod, t_prev, x_t.shape)
 
-        return x.clamp(-1, 1)
+        # 预测 x0
+        x0_pred = torch.clamp((x_t - torch.sqrt(torch.clamp(1 - a_bar_t, min=self.eps_guard)) * eps) /
+                              torch.sqrt(torch.clamp(a_bar_t, min=self.eps_guard)), min=-1.0, max=1.0)
+
+        # 确定性项
+        dir_xt = torch.sqrt(torch.clamp(a_bar_prev, min=self.eps_guard)) * x0_pred
+        # 残差项
+        sigma_t = eta * torch.sqrt(
+            torch.clamp((1 - a_bar_prev) / (1 - a_bar_t), min=self.eps_guard) * (1 - a_bar_t / a_bar_prev)
+        )
+        noise = torch.randn_like(x_t) if (eta > 0) else 0.0
+        x_prev = dir_xt + torch.sqrt(torch.clamp(1 - a_bar_prev, min=self.eps_guard)) * eps + sigma_t * noise
+        return x_prev
+
+    # -------------------- Public sampling API --------------------
+    @torch.no_grad()
+    def sample(
+        self,
+        batch_size: int,
+        method: Literal["ddpm", "ddim"] = "ddpm",
+        ddim_steps: int = 50,
+        eta: float = 0.0,
+        log_every_n: int = 50,
+        device: Optional[torch.device] = None,
+    ) -> Tensor:
+        """
+        Returns: x_0 in [-1,1], shape [B,C,H,W]
+        Note: sampling is forced to FP32 (no autocast) for stability.
+        """
+        if device is None:
+            device = next(self.parameters()).device
+
+        # 关闭 AMP：全程 FP32
+        torch.set_grad_enabled(False)
+        prev_autocast = torch.is_autocast_enabled()
+        if prev_autocast:
+            torch.set_autocast_enabled(False)
+
+        try:
+            x = torch.randn(batch_size, self.channels, self.image_size, self.image_size, device=device, dtype=torch.float32)
+
+            if method == "ddpm":
+                for i in reversed(range(self.T)):
+                    t = torch.full((batch_size,), i, device=device, dtype=torch.long)
+                    log_now = (i % max(1, log_every_n) == 0)
+                    x = self.p_sample(x, t, log_every=log_now)
+                x0 = torch.clamp(x, -1.0, 1.0)
+                return x0
+
+            elif method == "ddim":
+                # 均匀子序列
+                ts = torch.linspace(self.T - 1, 0, steps=ddim_steps, device=device).long()
+                for si in range(len(ts)):
+                    t = ts[si].expand(batch_size)
+                    t_prev = ts[si + 1].expand(batch_size) if si + 1 < len(ts) else torch.zeros_like(t)
+                    log_now = (si % max(1, log_every_n) == 0)
+                    x = self.ddim_step(x, t, t_prev, eta=eta, log_every=log_now)
+                x0 = torch.clamp(x, -1.0, 1.0)
+                return x0
+            else:
+                raise ValueError(f"Unknown sample method: {method}")
+        finally:
+            if prev_autocast:
+                torch.set_autocast_enabled(True)
+
+    # -------------------- Utility --------------------
+    def forward(self, x_start: Tensor, t: Tensor) -> Dict[str, Tensor]:
+        """For training: returns dict with 'loss'."""
+        return self.p_losses(x_start, t)

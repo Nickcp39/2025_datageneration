@@ -1,72 +1,51 @@
-.venv/
-__pycache__/
-runs_*/
-runs_local/
-runs_debug_small/
-runs_local_gray
-runs_local_rgb
-logs/
-*.log
-data/
-data2025/
-data2025_sample/
-*.pt
-*.pth
-*.ckpt
-.DS_Store
-data_RGB.zip
-# large data
-*.zip
-*.pt
-*.ckpt
-data*/
-runs*/
-logs/
+# =========================
+# Python project: clean .gitignore
+# =========================
 
-# large artifacts
-*.zip
-*.pt
-*.ckpt
-data*/
-runs*/
-logs/
-# venv / conda
+# --- Virtual envs ---
 .venv/
-env/
 venv/
+env/
 
-# IDE
+# --- IDE / Editor ---
 .vscode/
 .idea/
 
-# data & outputs
-data/
-data_*/*
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+
+# --- Python cache / metadata ---
+__pycache__/
+*.py[cod]
+*.ipynb_checkpoints/
+*.egg-info/
+
+# --- Logs ---
+logs/
+*.log
+events.out.tfevents.*
+
+# --- Large artifacts (models / checkpoints / archives) ---
+*.pt
+*.pth
+*.ckpt
+*.zip
+*.rar
+
+# --- Datasets (keep them local) ---
+/data/
+data_*/
+data*/
+
+# --- Training outputs ---
 runs*/
 runs_*/
 runs_local*/
 runs_debug*/
-*.ckpt
 ckpts/
 outputs/
 samples/
 
-# OS
-.DS_Store
-Thumbs.db
-
-# logs
-*.log
-events.out.tfevents.*
-
-# python cache
-__pycache__/
-*.py[cod]
-*.ipynb_checkpoints/
-
-# archives
-*.zip
-*.rar
-
-# images (only keep small readme/demo if needed)
+# --- Keep small README demos if needed ---
 !readme_assets/**
