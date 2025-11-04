@@ -30,3 +30,43 @@ logs/
 data*/
 runs*/
 logs/
+# venv / conda
+.venv/
+env/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# data & outputs
+data/
+data_*/*
+runs*/
+runs_*/
+runs_local*/
+runs_debug*/
+*.ckpt
+ckpts/
+outputs/
+samples/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# logs
+*.log
+events.out.tfevents.*
+
+# python cache
+__pycache__/
+*.py[cod]
+*.ipynb_checkpoints/
+
+# archives
+*.zip
+*.rar
+
+# images (only keep small readme/demo if needed)
+!readme_assets/**
