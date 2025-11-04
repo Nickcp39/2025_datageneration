@@ -49,3 +49,21 @@ samples/
 
 # --- Keep small README demos if needed ---
 !readme_assets/**
+# === training outputs ===
+runs/**
+!runs/README.md        # 保留一个说明文件
+!runs/.gitkeep         # 或者保留空目录标记
+*.pt
+*.ckpt
+*.pth
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.tif
+*.tiff
+
+# venv / cache
+.venv/
+__pycache__/
+*.pyc
