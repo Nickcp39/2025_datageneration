@@ -1,15 +1,33 @@
+# 说明：
+# 1) 统一使用 PyTorch cu121 轮子，兼容 3060 / 4090 / 大工作站（前提：NVIDIA 驱动 >= 535）。
+# 2) 第一行切到 PyTorch CUDA 轮子仓；第二行补回 PyPI 主仓给其它包用。
+# 3) 本文件同样要求 Python >= 3.10（若需 3.9，把首行 pip 标记改成 >= "3.9"）。
 
-# ==== Utilities ====
-tqdm>=4.65.0
+pip>=23; python_version >= "3.10"
+
+--index-url https://download.pytorch.org/whl/cu121
+--extra-index-url https://pypi.org/simple
+
+# ===== PyTorch 三件套（CUDA 12.1）=====
+torch==2.4.1+cu121
+torchvision==0.19.1+cu121
+torchaudio==2.4.1+cu121
+
+# ===== Diffusers 训练/采样栈 =====
+diffusers>=0.29.0
+accelerate>=0.33.0
+huggingface-hub>=0.25.0
+safetensors>=0.4.3
+transformers>=4.45.0   # 先配齐，后续少踩坑
+
+# ===== 通用工具 =====
+einops>=0.7.0
+tqdm>=4.66.0
 Pillow>=10.0.0
 numpy>=1.24.0
 
-# ==== Optional: 如果项目后面有数据加载或图像处理 ====
+# ===== 数据/图像处理 =====
 opencv-python
 scikit-image
 matplotlib
-diffusers
-transformers
-accelerate
-
 tensorboard
