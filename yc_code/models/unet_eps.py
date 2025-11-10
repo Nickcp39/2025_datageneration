@@ -2,7 +2,8 @@
 # UNet epsilon predictor for diffusion models (DDPM/DDIM)
 # - Stable sinusoidal timestep embedding (log-spaced, * 2π)
 # - ResBlocks with GroupNorm + FiLM(time): scale-shift on normalized activations
-# - Optional mid self-attention
+# - Optional mid self-attention（已修正维度计算）
+# - 统一时间轴语义钩子：set_max_timesteps(T)，支持 t 为 long 索引或已归一化 float
 # - I/O:
 #     x_t in [-1, 1], shape [B, C, H, W]
 #     t   as float/long tensor shape [B]
@@ -18,7 +19,7 @@ import torch.nn.functional as F
 class SinusoidalPosEmb(nn.Module):
     """
     Stable sinusoidal embedding for diffusion timesteps.
-    log-uniform frequencies in [1, 10000], multiplied by 2π for better coverage.
+    Log-uniform frequencies in [1, 10000], multiplied by 2π for better coverage.
     """
     def __init__(self, dim: int):
         super().__init__()
@@ -26,9 +27,12 @@ class SinusoidalPosEmb(nn.Module):
         self.dim = dim
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
-        # t: [B] (float or long)
+        # t: [B] (float in [0,1] or long indices)
         if t.dtype in (torch.int32, torch.int64, torch.long):
             t = t.float()
+        # clamp for safety if caller传入超界
+        t = torch.clamp(t, 0.0, 1.0)
+
         b = t.shape[0]
         device = t.device
         half = self.dim // 2
@@ -45,7 +49,12 @@ class SinusoidalPosEmb(nn.Module):
 
 # ---------- Building blocks ----------
 class SelfAttention2d(nn.Module):
-    """Simple spatial self-attention block."""
+    """
+    Spatial self-attention with correct tensor reshaping:
+      - Q,K,V from [B, C, H, W] -> [B, Hh, HW, Dh]
+      - Attn = softmax(Q @ K^T) over last dim
+      - Output project back to [B, C, H, W]
+    """
     def __init__(self, channels, heads=4, dim_head=32):
         super().__init__()
         self.heads = heads
@@ -56,13 +65,23 @@ class SelfAttention2d(nn.Module):
 
     def forward(self, x):
         b, c, h, w = x.shape
-        qkv = self.to_qkv(x).chunk(3, dim=1)
-        q, k, v = [t.reshape(b, self.heads, -1, h * w) for t in qkv]
-        q = q * self.scale
-        attn = q @ k.transpose(-1, -2)          # [B, H, HW, HW]
+        q, k, v = self.to_qkv(x).chunk(3, dim=1)  # [B, inner, H, W] * 3
+
+        # [B, Hh, HW, Dh]
+        def to_heads(t):
+            return t.view(b, self.heads, -1, h * w).transpose(2, 3)
+
+        q = to_heads(q) * self.scale            # [B, Hh, HW, Dh]
+        k = to_heads(k)                         # [B, Hh, HW, Dh]
+        v = to_heads(v)                         # [B, Hh, HW, Dh]
+
+        attn = q @ k.transpose(-1, -2)          # [B, Hh, HW, HW]
+        # 数值稳定：减去行最大值（仅在需要时可打开；softmax前中心化）
+        attn = attn - attn.amax(dim=-1, keepdim=True)
         attn = attn.softmax(dim=-1)
-        out = attn @ v                           # [B, H, HW, DH]
-        out = out.reshape(b, -1, h, w)
+
+        out = attn @ v                          # [B, Hh, HW, Dh]
+        out = out.transpose(2, 3).contiguous().view(b, -1, h, w)  # [B, inner, H, W]
         return self.proj(out)
 
 
@@ -71,6 +90,7 @@ class ResBlockFiLM(nn.Module):
     ResBlock with GroupNorm and FiLM time modulation:
       - apply FiLM (gamma, beta) *after* first GroupNorm and *before* activation.
       - to_t maps time embedding -> 2*out_ch (gamma, beta).
+      - 最后一层线性零初始化，让网络从近恒等映射起步（更稳）。
     """
     def __init__(self, in_ch, out_ch, t_emb_dim=None, groups=8, dropout=0.0):
         super().__init__()
@@ -93,6 +113,9 @@ class ResBlockFiLM(nn.Module):
                 nn.SiLU(),
                 nn.Linear(t_emb_dim, out_ch * 2)  # -> gamma, beta
             )
+            # zero-init so gamma≈0, beta≈0 at init
+            nn.init.zeros_(self.to_t[-1].weight)
+            nn.init.zeros_(self.to_t[-1].bias)
         else:
             self.to_t = None
 
@@ -130,6 +153,10 @@ class UNetEps(nn.Module):
         with_mid_attn: whether to enable self-attention at bottleneck
         groups:        GroupNorm groups
         dropout:       dropout inside ResBlocks (usually 0 for med images)
+
+    Notes:
+        - 统一时间轴：通过 set_max_timesteps(T) 设置 t_scale。
+          forward 支持 t 为 long 索引（0..T-1）或已归一化 float（0..1）。
     """
     def __init__(
         self,
@@ -142,6 +169,9 @@ class UNetEps(nn.Module):
     ):
         super().__init__()
         self.in_ch = in_ch
+
+        # 由引擎设置：1/(T-1)，默认为1（表示t已归一化）
+        self.register_buffer("t_scale", torch.tensor(1.0), persistent=False)
 
         # time embedding MLP (kept within time_dim)
         self.time_mlp = nn.Sequential(
@@ -178,13 +208,30 @@ class UNetEps(nn.Module):
             nn.Conv2d(base, in_ch, 1),
         )
 
+    @torch.no_grad()
+    def set_max_timesteps(self, T: int):
+        """
+        供引擎在构造后调用：net.set_max_timesteps(T)
+        当 forward 接收 long 索引 t (0..T-1) 时，内部自动归一化到 [0,1]
+        """
+        val = 1.0 / max(T - 1, 1)
+        # 放到与现有 buffer 同设备
+        self.t_scale = torch.tensor(val, device=self.t_scale.device)
+
     def forward(self, x, t):
         """
         x: [-1,1], shape [B, C, H, W]
-        t: [B] (float or long)
+        t: [B] (float in [0,1] or long indices)
         return: predicted epsilon (same shape as x)
         """
-        t_emb = self.time_mlp(t)
+        if t.dtype in (torch.int32, torch.int64, torch.long):
+            t_in = t.float() * self.t_scale
+        else:
+            t_in = t
+        # 安全：限制到 [0,1]
+        t_in = torch.clamp(t_in, 0.0, 1.0)
+
+        t_emb = self.time_mlp(t_in)
 
         # encoder
         x0 = self.inc(x)                                    # [B, b,  H,   W]
@@ -212,10 +259,17 @@ class UNetEps(nn.Module):
 
 # quick sanity check
 if __name__ == "__main__":
+    torch.set_grad_enabled(False)
     for c in (1, 3):
         net = UNetEps(in_ch=c, base=64, time_dim=256, with_mid_attn=True)
+        net.set_max_timesteps(1000)  # 与引擎一致的时间轴
         x = torch.randn(2, c, 256, 256)
-        t = torch.randint(0, 1000, (2,))
-        y = net(x, t)
-        print(f"in_ch={c} -> out shape:", y.shape)  # expect: [2, c, 256, 256]
-        assert y.shape[1] == c
+        t_long = torch.randint(0, 1000, (2,))
+        t_float = torch.rand(2)  # 已归一化时间
+
+        y1 = net(x, t_long)
+        y2 = net(x, t_float)
+
+        print(f"in_ch={c} -> out(long) shape:", y1.shape)  # expect: [2, c, 256, 256]
+        print(f"in_ch={c} -> out(float) shape:", y2.shape) # expect: [2, c, 256, 256]
+        assert y1.shape[1] == c and y2.shape[1] == c

@@ -67,3 +67,27 @@ runs/**
 .venv/
 __pycache__/
 *.pyc
+# venv / 编译缓存
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# 训练产物
+runs/
+.runs/
+**/samples/
+**/ckpts/
+*.pt
+*.pth
+*.log
+tensorboard/
+
+# 本地数据
+data/
+*.zip
+*.rar
+
+# IDE
+.vscode/
+.idea/

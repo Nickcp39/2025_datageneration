@@ -1,3 +1,12 @@
+# yc_code/data/gray_image_folder.py
+# 灰度/彩色通用数据集（保位深、张量域处理、与扩散引擎约定对齐）
+# - 形状: [B, C, H, W]
+# - 值域: normalize="tanh" -> [-1, 1]（与 ε-预测引擎一致）；"none" -> [0,1]
+# - 通道: channels ∈ {1,3}，确保 in_ch == out_ch == channels
+# - 轻量增广: 仅训练态启用（水平翻转）
+# - 16-bit 不降位：直接 numpy->tensor，避免 PIL 量化到 8-bit
+# - 可选返回路径：return_path=True 时返回 (x, path)
+
 import os, glob, random
 from typing import Tuple, List, Optional
 import numpy as np
@@ -77,20 +86,29 @@ class GrayImageFolder(Dataset):
         img_size: int = 256,
         channels: int = 3,                 # 1=灰度, 3=RGB
         center_crop: bool = False,
+        train: bool = True,                # 新增：训练/评估开关
         aug: bool = False,                 # 默认关闭增强，先稳
-        normalize: str = "tanh",           # 推荐 "tanh" -> [-1,1]，与扩散引擎对齐
+        normalize: str = "tanh",           # "tanh" -> [-1,1]（推荐）；"none" -> [0,1]
         extensions: Tuple[str, ...] = ("*.png","*.jpg","*.jpeg","*.bmp","*.tif","*.tiff"),
-        save_debug: bool = False,          # 新增：是否保存首样本 debug 图
-        debug_outdir: Optional[str] = None # 新增：debug 输出目录
+        save_debug: bool = False,          # 是否保存首样本 debug 图
+        debug_outdir: Optional[str] = None,# debug 输出目录
+        return_path: bool = False,         # 新增：是否返回 (x, path)
     ):
         super().__init__()
-        assert channels in (1, 3)
+        assert channels in (1, 3), "channels must be 1 or 3"
         assert normalize in ("none", "tanh")
-        self.root, self.img_size = root, int(img_size)
-        self.channels, self.center_crop, self.aug = int(channels), bool(center_crop), bool(aug)
+        assert img_size % 4 == 0, "img_size must be divisible by 4 for 2× downsample UNet"
+
+        self.root = root
+        self.img_size = int(img_size)
+        self.channels = int(channels)
+        self.center_crop = bool(center_crop)
+        self.train = bool(train)
+        self.aug = bool(aug)
         self.normalize = normalize
         self.save_debug = bool(save_debug)
         self.debug_outdir = debug_outdir
+        self.return_path = bool(return_path)
         self._saved_debug = False
 
         files: List[str] = []
@@ -100,16 +118,16 @@ class GrayImageFolder(Dataset):
         if not self.files:
             raise FileNotFoundError(f"No images found under: {root}")
 
-    def __len__(self): 
+    def __len__(self):
         return len(self.files)
 
-    def __getitem__(self, idx: int) -> torch.Tensor:
+    def __getitem__(self, idx: int):
         path = self.files[idx]
 
         # **关键**：直接转 numpy，保留位深（避免 PIL mode 转换丢 16-bit）
         with Image.open(path) as im:
             arr = np.array(im)  # HxW(,C)  uint8/uint16/float
-        x = _array_to_float_tensor(arr)  # [C,H,W] in [0,1], 保留16-bit动态范围
+        x = _array_to_float_tensor(arr)  # [C,H,W] in [0,1]
 
         # 通道整理（只在张量域做，避免 PIL 降位）
         c = x.shape[0]
@@ -134,15 +152,19 @@ class GrayImageFolder(Dataset):
             x = _center_square_tensor(x)
 
         # Resize 到 (S,S) —— 直接对 tensor 做几何变换，避免 PIL 模式问题
-        x = TF.resize(x, [self.img_size, self.img_size], interpolation=T.InterpolationMode.BILINEAR, antialias=True)
+        x = TF.resize(
+            x, [self.img_size, self.img_size],
+            interpolation=T.InterpolationMode.BILINEAR,
+            antialias=True
+        )
 
-        # 轻量增强（仅水平翻转；默认关闭）
-        if self.aug and random.random() < 0.5:
+        # 轻量增广（仅训练态启用）
+        if self.train and self.aug and random.random() < 0.5:
             x = torch.flip(x, dims=[2])
 
         # 归一化
         if self.normalize == "tanh":
-            x = x * 2.0 - 1.0   # [-1,1]
+            x = (x * 2.0 - 1.0).clamp_(-1.0, 1.0)   # [-1,1]
         # else: "none" 保持 [0,1]
 
         # 首样本保存 debug 图
@@ -152,8 +174,9 @@ class GrayImageFolder(Dataset):
             _save_debug_image(x, out_png)
             self._saved_debug = True
 
-        return x
-    
+        return (x, path) if self.return_path else x
+
+
 if __name__ == "__main__":
     import argparse
     from torch.utils.data import DataLoader
@@ -163,10 +186,14 @@ if __name__ == "__main__":
     parser.add_argument("--img_size", type=int, default=256)
     parser.add_argument("--channels", type=int, default=1)
     parser.add_argument("--center_crop", action="store_true")
+    parser.add_argument("--train", action="store_true")
+    parser.add_argument("--no-train", dest="train", action="store_false")
+    parser.set_defaults(train=True)
     parser.add_argument("--aug", action="store_true")
     parser.add_argument("--normalize", type=str, default="tanh", choices=["none", "tanh"])
     parser.add_argument("--save_debug", action="store_true")
     parser.add_argument("--debug_outdir", type=str, default="./runs_local_gray_3060")
+    parser.add_argument("--return_path", action="store_true")
     args = parser.parse_args()
 
     ds = GrayImageFolder(
@@ -174,12 +201,19 @@ if __name__ == "__main__":
         img_size=args.img_size,
         channels=args.channels,
         center_crop=args.center_crop,
+        train=args.train,
         aug=args.aug,
         normalize=args.normalize,
         save_debug=args.save_debug,
         debug_outdir=args.debug_outdir,
+        return_path=args.return_path,
     )
     print(f"[data] found {len(ds)} images under {args.root}")
     dl = DataLoader(ds, batch_size=4, num_workers=0, shuffle=True)
     batch = next(iter(dl))
-    print("[data] batch shape:", batch.shape, "| min/max:", float(batch.min()), float(batch.max()))
+    if args.return_path:
+        x, p = batch  # x:[B,C,H,W]  p: list[str]
+        print("[data] batch shape:", x.shape, "| min/max:", float(x.min()), float(x.max()))
+        print("[data] paths[0..1]:", p[:2])
+    else:
+        print("[data] batch shape:", batch.shape, "| min/max:", float(batch.min()), float(batch.max()))
