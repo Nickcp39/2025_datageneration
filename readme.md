@@ -144,11 +144,3 @@ Buffalo, NY · LinkedIn · GitHub
 🔖 复用声明
 
 仅供研究使用（research only）。如需用于商业或第三方发布，请先联系作者。
-
-✅ 一键提交示例
-git add -A
-git commit -m "Add cleaned README and unified self-engine pipeline"
-git push
-
-
-需要我把 train.sh / sample.sh / setup.sh 也按上述参数模板给你生成吗？
