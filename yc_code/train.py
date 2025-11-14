@@ -5,7 +5,16 @@ import json
 import time
 import argparse
 from pathlib import Path
+import os
+import math
+import json
+import time
+import argparse
+from pathlib import Path
 
+import torch
+
+from tqdm.auto import tqdm
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -15,7 +24,7 @@ from tqdm.auto import tqdm
 from dataset import build_dataloaders, save_debug_batch
 from unet import UNetEps
 from engine import DiffusionEngine
-
+import matplotlib.pyplot as plt
 # -----------------------
 # 小工具：存图（不依赖 torchvision）
 # -----------------------
@@ -120,6 +129,13 @@ def main():
     (save_root / 'ckpt').mkdir(parents=True, exist_ok=True)
     (save_root / 'samples').mkdir(parents=True, exist_ok=True)
 
+    # 日志缓存：记录训练过程中的 loss 和 eps_corr
+    history = {
+        'step': [],
+        'loss': [],
+        'eps_corr': [],
+    }
+
     # dataloaders
     train_dl, val_dl = build_dataloaders(
         data_root=args.data_root,
@@ -199,7 +215,15 @@ def main():
                         eps_pred.flatten(1), eps_true.flatten(1)
                     ).mean().item()
                 pbar.set_postfix(loss=f"{loss.item():.4f}", eps_corr=f"{eps_corr:+.3f}")
+                # 记录到 history 里
+                history['step'].append(int(global_step))
+                history['loss'].append(float(loss.item()))
+                history['eps_corr'].append(float(eps_corr))
 
+                # 顺便在终端打一行，方便你回看
+                tqdm.write(
+                    f"[step {global_step:06d}] loss={loss.item():.4f}, eps_corr={eps_corr:+.3f}"
+                )
             # periodic sample
             if global_step % args.sample_every == 0 and global_step > 0:
                 net.eval()
@@ -269,6 +293,30 @@ def main():
 
         dt = time.time() - t0
         tqdm.write(f"[ep {ep:03d}] done in {dt:.1f}s → saved epoch ckpt & samples.")
+        # 训练全部结束后，保存 loss 曲线和原始日志
+    if history['step']:
+        # 1）保存为 json，方便以后自己再分析
+        log_path = save_root / 'train_log.json'
+        with log_path.open('w') as f:
+            json.dump(history, f, indent=2)
+
+        # 2）画一张 loss / eps_corr 曲线图
+        try:
+            fig, ax1 = plt.subplots()
+            ax1.plot(history['step'], history['loss'], label='loss')
+            ax1.set_xlabel('global step')
+            ax1.set_ylabel('loss')
+
+            ax2 = ax1.twinx()
+            ax2.plot(history['step'], history['eps_corr'], linestyle='--', label='eps_corr')
+            ax2.set_ylabel('eps_corr')
+
+            fig.tight_layout()
+            fig.savefig(save_root / 'loss_curve.png', dpi=150)
+            plt.close(fig)
+            tqdm.write(f"[plot] saved loss_curve.png to {save_root}")
+        except Exception as e:
+            tqdm.write(f"[warn] failed to save loss curve figure: {e}")
 
 if __name__ == "__main__":
     main()
