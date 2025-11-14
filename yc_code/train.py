@@ -9,6 +9,8 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch import amp
+from tqdm.auto import tqdm
 
 from dataset import build_dataloaders, save_debug_batch
 from unet import UNetEps
@@ -48,24 +50,24 @@ class EMA:
     def __init__(self, model: nn.Module, decay: float = 0.9999):
         self.decay = decay
         self.shadow = {}
-        self.collected = {}
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                self.shadow[name] = param.detach().clone()
+        for name, p in model.named_parameters():
+            if p.requires_grad:
+                self.shadow[name] = p.detach().clone()
 
     @torch.no_grad()
     def update(self, model: nn.Module):
-        for name, param in model.named_parameters():
-            if not param.requires_grad: 
+        d = self.decay
+        for name, p in model.named_parameters():
+            if not p.requires_grad: 
                 continue
-            self.shadow[name].mul_(self.decay).add_(param.detach(), alpha=1.0 - self.decay)
+            self.shadow[name].mul_(d).add_(p.detach(), alpha=1.0 - d)
 
     @torch.no_grad()
     def copy_to(self, model: nn.Module):
-        for name, param in model.named_parameters():
-            if not param.requires_grad: 
+        for name, p in model.named_parameters():
+            if not p.requires_grad: 
                 continue
-            param.data.copy_(self.shadow[name].data)
+            p.data.copy_(self.shadow[name].data)
 
 # -----------------------
 # 训练主逻辑
@@ -93,7 +95,7 @@ def parse_args():
     ap.add_argument('--lr', type=float, default=2e-4)
     ap.add_argument('--weight_decay', type=float, default=1e-4)
     ap.add_argument('--grad_clip', type=float, default=1.0)
-    ap.add_argument('--amp', action='store_true')
+    ap.add_argument('--amp', action='store_true', help='开启混合精度（torch.amp）')
     ap.add_argument('--ema_decay', type=float, default=0.9999)
     # logging / save
     ap.add_argument('--save_dir', type=str, default='./runs')
@@ -141,7 +143,7 @@ def main():
 
     # optim & EMA
     opt = optim.AdamW(net.parameters(), lr=args.lr, betas=(0.9,0.999), weight_decay=args.weight_decay)
-    scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
+    scaler = amp.GradScaler('cuda', enabled=args.amp)
     ema = EMA(net, decay=args.ema_decay) if args.ema_decay > 0 else None
 
     # resume
@@ -149,10 +151,10 @@ def main():
     if args.resume and Path(args.resume).is_file():
         ckpt = torch.load(args.resume, map_location=device)
         net.load_state(b := ckpt['model'])
-        if 'engine_buffers' in ckpt:  # 兼容性：引擎 buffer 可选
+        if 'engine_buffers' in ckpt:
             eng.load_state_dict(ckpt['engine_buffers'], strict=False)
         opt.load_state_dict(ckpt['opt'])
-        if scaler.is_enabled() and 'scaler' in ckpt: 
+        if scaler.is_enabled() and 'scaler' in ckpt:
             scaler.load_state_dict(ckpt['scaler'])
         if ema and 'ema' in ckpt:
             ema.shadow = ckpt['ema']
@@ -165,19 +167,20 @@ def main():
     for ep in range(start_ep, args.epochs):
         net.train()
         t0 = time.time()
-        for x0 in train_dl:
+
+        pbar = tqdm(train_dl, desc=f"Epoch {ep:03d}", ncols=100, leave=False)
+        for x0 in pbar:
             x0 = x0.to(device, non_blocking=True)
             b = x0.size(0)
             t = torch.randint(0, eng.T, (b,), device=device, dtype=torch.long)
 
             opt.zero_grad(set_to_none=True)
             if scaler.is_enabled():
-                with torch.cuda.amp.autocast():
+                with amp.autocast('cuda'):
                     loss = eng.p_losses(x0, t)
                 scaler.scale(loss).backward()
                 torch.nn.utils.clip_grad_norm_(net.parameters(), args.grad_clip)
-                scaler.step(opt)
-                scaler.update()
+                scaler.step(opt); scaler.update()
             else:
                 loss = eng.p_losses(x0, t)
                 loss.backward()
@@ -187,24 +190,21 @@ def main():
             if ema:
                 ema.update(net)
 
-            # logging
+            # logging on progress bar
             if global_step % args.log_every == 0:
                 with torch.no_grad():
-                    # 训练诊断：epsilon 相关性（看有没有在学）
                     xt, eps_true = eng.q_sample(x0, t)
                     eps_pred = net(xt, t)
                     eps_corr = torch.nn.functional.cosine_similarity(
                         eps_pred.flatten(1), eps_true.flatten(1)
                     ).mean().item()
-                print(f"[ep {ep:03d}] step {global_step:06d} | loss {loss.item():.4f} | eps_corr {eps_corr:+.4f}")
+                pbar.set_postfix(loss=f"{loss.item():.4f}", eps_corr=f"{eps_corr:+.3f}")
 
             # periodic sample
             if global_step % args.sample_every == 0 and global_step > 0:
                 net.eval()
                 with torch.no_grad():
-                    # 采样禁 AMP；优先用 EMA 权重
-                    if ema:
-                        ema.copy_to(net)
+                    if ema: ema.copy_to(net)
                     samples = eng.sample(
                         batch_size=min(8, args.batch_size),
                         shape=(args.in_ch, args.image_size, args.image_size),
@@ -213,6 +213,7 @@ def main():
                         eta=args.ddim_eta,
                     )
                 save_grid(samples, str(save_root / 'samples' / f'step_{global_step:06d}.png'), nrow=4)
+                pbar.write(f"[sample] step {global_step} → saved preview")
                 net.train()
 
             # periodic checkpoint
@@ -225,7 +226,6 @@ def main():
                     'global_step': global_step,
                     'args': vars(args),
                 }
-                # 可选保存引擎 buffer（alphas/betas 等）；恢复时非必须
                 try:
                     to_save['engine_buffers'] = eng.state_dict()
                 except Exception:
@@ -235,7 +235,7 @@ def main():
                 if ema:
                     to_save['ema'] = {k: v.cpu() for k, v in ema.shadow.items()}
                 torch.save(to_save, ckpt_path)
-                print(f"Saved ckpt to {ckpt_path}")
+                pbar.write(f"[ckpt ] saved {ckpt_path}")
 
             global_step += 1
 
@@ -268,8 +268,7 @@ def main():
         torch.save(to_save, ckpt_path)
 
         dt = time.time() - t0
-        print(f"[ep {ep:03d}] done in {dt:.1f}s, saved epoch ckpt & samples.")
+        tqdm.write(f"[ep {ep:03d}] done in {dt:.1f}s → saved epoch ckpt & samples.")
 
 if __name__ == "__main__":
     main()
-
