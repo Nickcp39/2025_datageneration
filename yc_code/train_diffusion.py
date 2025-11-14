@@ -267,7 +267,8 @@ def main():
                         'time_dim': args.time_dim,
                         'mid_attn': args.mid_attn,
                         'preview_method': args.preview_method,
-                        'ddim_steps': args.ddim_steps,
+                        'ddim'
+                        '_steps': args.ddim_steps,
                     }
                 }, ckpt_path)
                 pbar.write(f"saved: {ckpt_path}")
