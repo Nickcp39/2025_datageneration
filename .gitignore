@@ -91,3 +91,4 @@ data/
 # IDE
 .vscode/
 .idea/
+evaluation_ssim/
