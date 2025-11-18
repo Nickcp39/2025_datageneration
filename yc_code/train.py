@@ -52,6 +52,70 @@ def save_grid(x: torch.Tensor, out_path: str, nrow: int = 4):
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(canvas).save(out_path)
 
+# =======================
+# === NEW: forward 可视化辅助函数
+# =======================
+def predict_x0_from_eps(eng, x_t, t, eps_pred):
+    """
+    根据 ε-pred 把 x_t 反推回 x0_hat（标准 DDPM 公式）
+    ...
+    """
+    # ⚠️ CHANGE: Call the standalone _extract function, not eng._extract
+    sqrt_alpha_bar = _extract(torch.sqrt(eng.alphas_cumprod), t, x_t.shape)
+    sqrt_one_minus_alpha_bar = _extract(torch.sqrt(1.0 - eng.alphas_cumprod), t, x_t.shape)
+    x0_hat = (x_t - sqrt_one_minus_alpha_bar * eps_pred) / sqrt_alpha_bar
+    return x0_hat.clamp(-1.0, 1.0)
+
+# Add this utility function
+def _extract(a, t, x_shape):
+    """
+    Extracts the values from a 1D tensor `a` at given indices `t` and
+    reshapes them to match the spatial dimensions of `x_shape`.
+    """
+    b = t.shape[0] # Batch size
+    out = a.gather(-1, t.cpu()).float() # Get the right value for each batch element
+    out = out.reshape(b, *((1,) * (len(x_shape) - 1))).to(t.device)
+    return out
+
+def save_forward_denoise_progress(net, eng, x0_vis, t_list, device, out_path, n_show=4):
+    """
+    固定一批 x0_vis，在多个 t 上：
+
+      每个 t:
+        row1: x0 (clean)
+        row2: x_t (noisy)
+        row3: x0_hat (denoised)
+
+    最后把所有 t 堆在一起，保存成一个大图。
+    """
+    net.eval()
+    with torch.no_grad():
+        x0 = x0_vis[:n_show].to(device)  # 只取前 n_show 个，避免太大
+        all_imgs = []
+
+        for t_scalar in t_list:
+            t = torch.full((x0.size(0),), t_scalar, device=device, dtype=torch.long)  # [B]
+
+            # 前向加噪
+            x_t, eps_true = eng.q_sample(x0, t)
+            # 网络预测噪声
+            eps_pred = net(x_t, t)
+            # 从 eps_pred 反推 x0_hat
+            x0_hat = predict_x0_from_eps(eng, x_t, t, eps_pred)
+
+            # 按顺序堆：clean / noisy / denoised
+            all_imgs.append(x0)
+            all_imgs.append(x_t)
+            all_imgs.append(x0_hat)
+
+        grid = torch.cat(all_imgs, dim=0)  # [3 * len(t_list) * B, 1, H, W]
+        save_grid(grid, str(out_path), nrow=n_show)
+
+    net.train()
+# =======================
+# === NEW 结束
+# =======================
+
 # -----------------------
 # EMA（直接内置，无需额外文件）
 # -----------------------
@@ -67,14 +131,14 @@ class EMA:
     def update(self, model: nn.Module):
         d = self.decay
         for name, p in model.named_parameters():
-            if not p.requires_grad: 
+            if not p.requires_grad:
                 continue
             self.shadow[name].mul_(d).add_(p.detach(), alpha=1.0 - d)
 
     @torch.no_grad()
     def copy_to(self, model: nn.Module):
         for name, p in model.named_parameters():
-            if not p.requires_grad: 
+            if not p.requires_grad:
                 continue
             p.data.copy_(self.shadow[name].data)
 
@@ -89,11 +153,11 @@ def parse_args():
     ap.add_argument('--batch_size', type=int, default=8)
     ap.add_argument('--num_workers', type=int, default=4)
     ap.add_argument('--val_ratio', type=float, default=0.05)
-    ap.add_argument('--augment_train', action='store_true', help='启用轻量增强')
+    ap.add_argument('--augment_train', action='store_true', help='enable light augmentation')
     # model/engine
     ap.add_argument('--in_ch', type=int, default=1)
     ap.add_argument('--base', type=int, default=64)
-    ap.add_argument('--mult', type=str, default="1,2,2,4", help='通道倍率, 逗号分隔')
+    ap.add_argument('--mult', type=str, default="1,2,2,4", help='double channel, sepearaete with commo ')
     ap.add_argument('--t_dim', type=int, default=256)
     ap.add_argument('--timesteps', type=int, default=1000)
     ap.add_argument('--schedule', type=str, default='linear', choices=['linear','cosine'])
@@ -128,6 +192,11 @@ def main():
     save_root = Path(args.save_dir) / args.exp_name
     (save_root / 'ckpt').mkdir(parents=True, exist_ok=True)
     (save_root / 'samples').mkdir(parents=True, exist_ok=True)
+    # --- 保存本次 run 的参数配置，方便复现 ---
+    args_path = save_root / 'args.json'
+    with args_path.open('w') as f:
+        json.dump(vars(args), f, indent=2)
+    # --- 保存本次 run 的参数配置，方便复现 ---
 
     # 日志缓存：记录训练过程中的 loss 和 eps_corr
     history = {
@@ -148,6 +217,27 @@ def main():
 
     # quick sanity visualization
     save_debug_batch(train_dl, str(save_root / 'samples' / 'data_debug.png'), n=16)
+
+    # =======================
+    # === NEW: 固定一批样本 + 若干 t 用于 forward 可视化
+    # =======================
+    try:
+        x0_vis = next(iter(val_dl))
+    except Exception:
+        x0_vis = next(iter(train_dl))
+
+    # 选一些代表性的时间步，可以按需要改
+    T = args.timesteps
+    t_vis_list = [
+        0,
+        max(1, T // 50),
+        max(1, T // 20),
+        max(1, T // 10),
+        max(1, T // 4),
+        max(1, T // 2),
+        int(T * 0.8),
+    ]
+    # =======================
 
     # model / engine
     net = UNetEps(in_ch=args.in_ch, base=args.base, mult=mult, t_dim=args.t_dim).to(device)
@@ -224,8 +314,10 @@ def main():
                 tqdm.write(
                     f"[step {global_step:06d}] loss={loss.item():.4f}, eps_corr={eps_corr:+.3f}"
                 )
+
             # periodic sample
             if global_step % args.sample_every == 0 and global_step > 0:
+                # 1）正常 backward 采样 preview
                 net.eval()
                 with torch.no_grad():
                     if ema: ema.copy_to(net)
@@ -237,7 +329,21 @@ def main():
                         eta=args.ddim_eta,
                     )
                 save_grid(samples, str(save_root / 'samples' / f'step_{global_step:06d}.png'), nrow=4)
-                pbar.write(f"[sample] step {global_step} → saved preview")
+                pbar.write(f"[sample] step {global_step} -> saved preview")
+
+                # 2）=== NEW: forward 学习过程可视化（x0 -> x_t -> x0_hat）
+                forward_path = save_root / 'samples' / f'forward_step_{global_step:06d}.png'
+                save_forward_denoise_progress(
+                    net=net,
+                    eng=eng,
+                    x0_vis=x0_vis,
+                    t_list=t_vis_list,
+                    device=device,
+                    out_path=forward_path,
+                    n_show=min(4, args.batch_size)
+                )
+                pbar.write(f"[forward] step {global_step} -> saved forward denoise viz")
+
                 net.train()
 
             # periodic checkpoint
@@ -292,7 +398,7 @@ def main():
         torch.save(to_save, ckpt_path)
 
         dt = time.time() - t0
-        tqdm.write(f"[ep {ep:03d}] done in {dt:.1f}s → saved epoch ckpt & samples.")
+        tqdm.write(f"[ep {ep:03d}] done in {dt:.1f}s -> saved epoch ckpt & samples.")
         # 训练全部结束后，保存 loss 曲线和原始日志
     if history['step']:
         # 1）保存为 json，方便以后自己再分析
