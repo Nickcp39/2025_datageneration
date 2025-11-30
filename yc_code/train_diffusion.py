@@ -146,11 +146,13 @@ def main():
         net.set_max_timesteps(args.timesteps)
 
     engine = DiffusionEngine(
-        image_size=args.image_size,
-        channels=args.channels,
-        T=args.timesteps,   # 注意：参数名是 T
-        # schedule="cosine",
-    ).to(device)            # 引擎实现了 to()，会把内部表移动到 GPU
+            image_size=args.image_size,
+            channels=args.channels,
+            T=args.timesteps,
+            schedule="linear",
+            beta_start=1e-4,
+            beta_end=2e-2,
+    ).to(device)
 
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=0.0)
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
