@@ -1,0 +1,19 @@
+{
+  "data_root": "../Dataset",
+  "image_size": 256,
+  "batch_size": 8,
+  "num_workers": 4,
+  "epochs": 200,
+  "timesteps": 1000,
+  "lr": 0.0001,
+  "beta1":0.9,
+  "beta2": 0.999,
+  "beta_start": 1e-4,
+  "beta_end": 2e-2,
+  "project": "PA_image_generation",
+  "run_name": "P3",
+  "save_dir": "../Results/results_image/P1_test_results",
+  "save_interval": 10,
+  "seed": 2025,
+  "device": "cuda:0"
+}
