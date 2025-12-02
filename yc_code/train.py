@@ -69,13 +69,24 @@ def predict_x0_from_eps(eng, x_t, t, eps_pred):
 # Add this utility function
 def _extract(a, t, x_shape):
     """
-    Extracts the values from a 1D tensor `a` at given indices `t` and
-    reshapes them to match the spatial dimensions of `x_shape`.
+    从 1D tensor `a` 中按 batch 索引 t 取出对应的值，
+    再 reshape 成和 x_shape 匹配的广播形状。
+    - a: shape [T]
+    - t: shape [B]，在 GPU 上
+    - x_shape: e.g. [B, C, H, W]
     """
-    b = t.shape[0] # Batch size
-    out = a.gather(-1, t.cpu()).float() # Get the right value for each batch element
-    out = out.reshape(b, *((1,) * (len(x_shape) - 1))).to(t.device)
+    # 确保 a 和 t 在同一个 device
+    t = t.view(-1).long()
+    a = a.to(t.device)
+
+    # a: [T], t: [B] -> out: [B]
+    out = a.gather(0, t).float()
+
+    # reshape 成 [B, 1, 1, 1, ...]，方便广播到 x_shape
+    b = t.shape[0]
+    out = out.view(b, *([1] * (len(x_shape) - 1)))
     return out
+
 
 def save_forward_denoise_progress(net, eng, x0_vis, t_list, device, out_path, n_show=4):
     """
