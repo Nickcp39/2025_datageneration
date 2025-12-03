@@ -11,7 +11,7 @@
   "beta_start": 1e-4,
   "beta_end": 2e-2,
   "project": "PA_image_generation",
-  "run_name": "P3",
+  "run_name": "P1",
   "save_dir": "../Results/results_image/P1_test_results",
   "save_interval": 10,
   "seed": 2025,
