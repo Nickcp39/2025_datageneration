@@ -5,7 +5,7 @@ import math
 
 import torch
 import torchvision.utils as vutils
-import wandb
+# import wandb
 
 from network import UNetModel, GaussianDiffusion
 
@@ -59,30 +59,44 @@ def main():
     diffusion.load_state_dict(ckpt["diffusion_state"], strict=False)
     print(f"Loaded checkpoint from epoch {ckpt.get('epoch', 'NA')}")
 
-    # ===== wandb (可选，用于记录测试样本) =====
-    wandb.init(project=args.project, name=args.run_name)
+    # ===== wandb (已关闭) =====
+    # wandb.init(project=args.project, name=args.run_name)
 
     diffusion.eval()
+    all_imgs = []
+
     with torch.no_grad():
-        samples = diffusion.sample(batch_size=args.num_samples)  # [-1,1]
+        print("Start sampling ...")
+        for i in range(args.num_samples):
+            print(f"Sampling image {i+1}/{args.num_samples} ...")
+            # 一次只采样 1 张
+            sample = diffusion.sample(batch_size=1)  # [1, 1, H, W], 范围 [-1, 1]
+            img = sample[0]  # [1, H, W]
 
-    # 保存单张 & grid
-    grid = vutils.make_grid(samples, nrow=int(math.sqrt(args.num_samples)),
-                            normalize=True, value_range=(-1, 1))
-    grid_path = os.path.join(args.out_dir, "samples_grid.png")
-    vutils.save_image(grid, grid_path)
-    print(f"Saved grid image to {grid_path}")
+            img_path = os.path.join(args.out_dir, f"sample_{i:03d}.png")
+            # [-1,1] -> [0,1]
+            vutils.save_image((img + 1) / 2, img_path)
+            print(f"Saved {img_path}")
 
-    # 单张保存
-    for i in range(args.num_samples):
-        img = samples[i]
-        img_path = os.path.join(args.out_dir, f"sample_{i:03d}.png")
-        # [-1,1] -> [0,1]
-        vutils.save_image((img + 1) / 2, img_path)
+            all_imgs.append(img)
 
-    # 上传到 wandb
-    wandb.log({"test/samples": wandb.Image(grid)})
-    print("Samples logged to wandb.")
+        print("Sampling done.")
+
+    # 如果有多张图，就再拼一个 grid
+    if len(all_imgs) > 0:
+        samples = torch.stack(all_imgs, dim=0)  # [N, 1, H, W]
+        grid = vutils.make_grid(
+            samples,
+            nrow=int(math.sqrt(len(all_imgs))),
+            normalize=True,
+            value_range=(-1, 1),
+        )
+        grid_path = os.path.join(args.out_dir, "samples_grid.png")
+        vutils.save_image(grid, grid_path)
+        print(f"Saved grid image to {grid_path}")
+
+    # wandb.log({"test/samples": wandb.Image(grid)})
+    print("Samples logged (wandb disabled).")
 
 
 if __name__ == "__main__":
