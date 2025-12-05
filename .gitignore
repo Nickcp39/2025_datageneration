@@ -92,3 +92,5 @@ data/
 .vscode/
 .idea/
 evaluation_ssim/
+wandb
+.wandb/
