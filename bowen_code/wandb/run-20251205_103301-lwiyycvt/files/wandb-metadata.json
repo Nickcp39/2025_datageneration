@@ -1,0 +1,44 @@
+{
+  "os":  "Windows-10-10.0.26100-SP0",
+  "python":  "CPython 3.10.6",
+  "startedAt":  "2025-12-05T15:33:01.690835Z",
+  "args":  [
+    "--config",
+    "config1.json"
+  ],
+  "program":  "I:\\yc_research\\2025_datageneration\\python_code\\bowen_code\\main.py",
+  "codePath":  "bowen_code\\main.py",
+  "codePathLocal":  "main.py",
+  "git":  {
+    "remote":  "https://github.com/Nickcp39/2025_datageneration.git",
+    "commit":  "0004b7fd5e5c99cdbf837042833f050544653104"
+  },
+  "email":  "wxsnbob96@gmail.com",
+  "root":  "I:\\yc_research\\2025_datageneration\\python_code\\bowen_code",
+  "host":  "DESKTOP-DCPENJ4",
+  "executable":  "C:\\Users\\nickc\\anaconda3\\envs\\LSTM_2025\\python.exe",
+  "cpu_count":  6,
+  "cpu_count_logical":  12,
+  "gpu":  "NVIDIA GeForce RTX 3060 Ti",
+  "gpu_count":  1,
+  "disk":  {
+    "/":  {
+      "total":  "20000553295872",
+      "used":  "1808873971712"
+    }
+  },
+  "memory":  {
+    "total":  "68640796672"
+  },
+  "gpu_nvidia":  [
+    {
+      "name":  "NVIDIA GeForce RTX 3060 Ti",
+      "memoryTotal":  "8589934592",
+      "cudaCores":  4864,
+      "architecture":  "Ampere",
+      "uuid":  "GPU-16b96b5c-ce6f-a1f6-3ad4-127093dac8b5"
+    }
+  ],
+  "cudaVersion":  "12.6",
+  "writerId":  "qq925j375ytuyzaqiixcwh3u98txh9hu"
+}

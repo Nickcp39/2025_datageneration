@@ -17,6 +17,8 @@ from dataset import build_dataloaders
 from network import UNetModel, GaussianDiffusion
 
 from copy import deepcopy
+os.environ["WANDB_MODE"] = "offline"
+
 
 def update_ema(ema_model, model, decay: float = 0.999):
     """
@@ -134,8 +136,14 @@ def sample_and_log_images(diffusion: GaussianDiffusion,
 def main():
     args = parse_args()
     set_seed(args.seed)
-    wandb.login(key="3c81fd27191085f58004d8d98cd450171018a724")
-    wandb.init(project=args.project, name=args.run_name)
+    
+    # wandb.login(key="3c81fd27191085f58004d8d98cd450171018a724")
+    # wandb.init(project=args.project, name=args.run_name)
+    wandb.init(
+        project=args.project,
+        name=args.run_name,
+        mode="offline",   # 再保险一层，配合上面的 WANDB_MODE
+    )
     os.makedirs(args.save_dir, exist_ok=True)
 
     # ========== Data ==========
@@ -193,6 +201,7 @@ def main():
             global_step += 1
 
             if global_step % 50 == 0:
+                print(f"[Epoch {epoch} | step {global_step}] train_loss={loss.item():.6f}")
                 wandb.log({"train/loss": loss.item(),
                            "train/epoch": epoch},
                           step=global_step)

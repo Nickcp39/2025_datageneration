@@ -1,5 +1,5 @@
 {
-  "data_root": "../Dataset",
+  "data_root": "../data/bowen_patch_256_12052025",
   "image_size": 256,
   "batch_size": 8,
   "num_workers": 4,
